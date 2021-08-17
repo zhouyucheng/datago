@@ -1,0 +1,58 @@
+# 假设以下每张表都在各个独立的数据库实例里
+
+# 学生的属性信息，有 sid, name, age
+student_db: &student_db
+  dsn: 'mysql://user:passwd@db1-student:3306/student_db?interpolateParams=true&sql_mode=TRADITIONAL&parseTime=true&loc=UTC'
+
+# 课程分数信息， 有 sid, cid(课程id), score
+score_db: &score_db
+  dsn: 'mysql://user:passwd@db2-score:3306/score_db?interpolateParams=true&sql_mode=TRADITIONAL&parseTime=true&loc=UTC'
+
+# 课程详情, 有 cid, course_name
+course_db: &course_db
+  dsn: 'mysql://user:passwd@db3-course:3306/course_db?interpolateParams=true&sql_mode=TRADITIONAL&parseTime=true&loc=UTC'
+
+# 有两种 filter， 作为子查询的filter和需要遍历进行过滤的filter，属性分别为 one 和 iter
+# filter_type=one的filter，被引用时，只能当做子查询进行过滤，结果集必定是一列的集合，可以使用 in， not in 进行过滤
+# filter_type=iter的filter，被引用时，必定被作为遍历过滤，只能使用 = 运算符进行过滤，不能使用范围过滤运算符(因为会造成数据重复)
+
+# 查询年龄大于20岁的学生， 没有 filter_type， 说明不需要维度过滤
+student_result: &student_result
+  db: *student_db
+  exsql: "select sid from student_db.student where age>20"
+
+# 查询年龄大于20岁的学生以及他们对应的课程分数, filter_type=one，说明相关filter是子查询
+score_result: &score_result
+  filter_type: one
+  filter: *student_result
+  db: *score_db
+  exsql: "select {{.sid}}, cid, score from score_db.score where sid in ({{.sid}})"
+
+# 查询年龄大于20岁的学生以及他们对应的课程的分数、课程详情, filter_type=iter，说明相关filter是遍历过滤
+course_result: &course_result
+  filter_type: iter
+  filter: *score_result
+  db: *course_db
+  # 因为会遍历每条数据对db进行查询，会有性能问题
+  exsql: "select {{.sid}}, course_name, {{.score}} from course_db.course where cid={{.cid}}"
+  # todo 可以根据场景指定是否cached，cached为true，则cid相应的列会被缓存，遇到相同的cid时，直接使用相关维度数据
+  # cached: true
+
+# 查询年龄大于20岁的学生信息以及他们对应的课程的分数、课程详情, filter_type=iter，说明相关filter是遍历过滤
+all_result: &all_result
+  filter_type: iter
+  filter: *course_result
+  db: *student_db
+  exsql: "select sid, name, age, '{{.course_name}}', {{.score}} from student_db.student where sid={{.sid}}"
+
+# 查询年龄大于20岁的学生信息以及他们对应的课程的分数、课程详情, filter_type=iter，说明相关filter是遍历过滤
+insert_result: &insert_result
+  filter_type: iter
+  filter: *all_result
+  db: *student_db
+  # 执行时会批量插入, values 是关键字，根据第一个values进行切分语句
+  exsql: "insert into report_db.student_course_score(sid, name, course_name, score) values ({{.sid}}, '{{.name}}', {{.age}}, '{{.course_name}}', {{.score}}) on duplicate key update score=values(score)"
+
+# job的入口，只有配置了这个，才会执行任务，可以按顺序执行多个job
+jobs:
+  - *insert_result
